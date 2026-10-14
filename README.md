@@ -49,6 +49,66 @@ The Python implementation uses `read1()` for SSE responses so streamed tokens ar
 
 ## Usage
 
+### Trae custom models
+
+Run the proxy **on the same computer as Trae**, then add a separate custom
+configuration for each model under **Settings → Models → Add Model → Custom
+Model**. Enable **Full URL** and enter the matching API format and URL below.
+Use your AgentRouter API key in each configuration.
+
+| Model ID | Trae API format | Full request URL |
+|----------|-----------------|------------------|
+| `deepseek-v4-flash` | OpenAI Chat Completions | `http://127.0.0.1:8317/v1/chat/completions` |
+| `gpt-6-astra` | OpenAI Chat Completions | `http://127.0.0.1:8317/v1/chat/completions` |
+| `claude-opus-5` | Anthropic Messages | `http://127.0.0.1:8317/v1/messages` |
+| `claude-opus-4-8` | Anthropic Messages | `http://127.0.0.1:8317/v1/messages` |
+
+These mappings follow the protocol badges in the supplied AgentRouter model
+list: `chat` means Chat Completions; `claude_native` means Anthropic Messages.
+GPT in that list does **not** advertise `claude_native`, and those Claude models
+do **not** advertise `chat`. Changing only the model ID in a Claude configuration
+does not change its API protocol. The proxy forwards requests; it does not
+convert Anthropic requests into OpenAI requests or vice versa.
+
+Select the added custom model explicitly in Trae chat. For the first test, leave
+sampling settings and context/output limits at their defaults. For GPT, use the
+matching model-family setting if your Trae version exposes it: the official
+documentation describes GPT-family adaptation of the output-token field.
+Do not reuse Claude-specific sampling or output-limit settings for GPT.
+
+The same settings are recorded in [trae-models.json](trae-models.json). This is a
+reference file for manual configuration and the verification script, **not** a
+Trae import format. Adjust the host and port if your proxy uses different values.
+Keep `AR_UPSTREAM=https://agentrouter.org` when using these full URLs.
+
+[Trae's official model configuration documentation](https://docs.trae.cn/ide_models)
+explains the API formats and Full URL switch. Protocol badges indicate advertised
+support, not guaranteed model availability: the screenshot marks GPT and both
+Claude models as `Demote`.
+
+Verify all four configurations from the computer running your proxy:
+
+```bash
+python verify_models.py
+```
+
+The script asks for the API key without displaying it, tests each model with
+ordinary and streamed requests, and exits with an error if any test fails.
+It uses short prompts and requests up to 256 output tokens so reasoning models
+have some room to produce visible text. Eight inference requests may consume
+API credit. You can target one model with `--model deepseek-v4-flash` or change
+the endpoint with `--base-url http://127.0.0.1:8320`.
+
+HTML/WAF responses now produce a JSON 502 error instead of being passed to Trae
+as an apparently successful API response. An upstream authentication, quota,
+model-availability, or unsupported-parameter error is passed through unchanged.
+If tests fail, use the printed status and error to distinguish upstream problems
+from Trae configuration. The proxy preserves the existing default User-Agent;
+there is no verified basis for assigning different identities to these models.
+
+The old `python ar_proxy.py` command is retained as an entry point to `proxy.py`,
+so both Python commands use the streaming and response fixes.
+
 ### Quick Start
 
 Run the proxy in the foreground:
