@@ -30,6 +30,7 @@ import http.client
 import http.server
 import json
 import os
+import re
 import ssl
 from urllib.parse import urlsplit
 
@@ -138,7 +139,7 @@ class SseSanitizer:
         if not data_lines:
             return frame + b"\n\n"
 
-        payload = b"".join(x[5:].strip() for x in data_lines)
+        payload = b"\n".join(x[6:] if x[5:6] == b" " else x[5:] for x in data_lines)
 
         if payload == b"[DONE]":
             return frame + b"\n\n"
@@ -149,7 +150,7 @@ class SseSanitizer:
             vlog("dropped unparsable SSE frame:", payload[:200])
             return None
 
-        if not isinstance(value, (dict, list)):
+        if not isinstance(value, dict):
             vlog("dropped null/non-object SSE frame:", payload[:200])
             return None
 
@@ -193,12 +194,58 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         if CONFIG.verbose:
             super().log_message(fmt, *args)
 
+    def read_body(self):
+        transfer = self.headers.get("Transfer-Encoding", "").lower()
+        if transfer:
+            if transfer != "chunked" or self.headers.get("Content-Length") is not None:
+                raise ValueError("Unsupported or ambiguous request framing")
+            chunks = []
+            while True:
+                line = self.rfile.readline(8193)
+                if not line.endswith(b"\r\n") or len(line) > 8192:
+                    raise ValueError("Invalid chunk header")
+                size = int(line.split(b";", 1)[0].strip(), 16)
+                if size < 0:
+                    raise ValueError("Invalid chunk size")
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline(8193)
+                        if trailer == b"\r\n":
+                            return b"".join(chunks)
+                        if not trailer.endswith(b"\r\n") or len(trailer) > 8192:
+                            raise ValueError("Invalid chunk trailer")
+                chunk = self.rfile.read(size)
+                if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                    raise ValueError("Incomplete request chunk")
+                chunks.append(chunk)
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length < 0:
+            raise ValueError("Invalid Content-Length")
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            raise ValueError("Incomplete request body")
+        return body
+
+    def json_error(self, status, message, error_type="proxy_error"):
+        payload = json.dumps({"error": {"type": error_type, "message": message}}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+
     def handle_proxy(self):
         incoming_path = self.path if self.path.startswith("/") else "/" + self.path
         target_path = CONFIG.base_path + incoming_path
 
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length) if length else b""
+        try:
+            body = self.read_body()
+        except ValueError as exc:
+            self.json_error(400, str(exc))
+            return
 
         headers = upstream_headers(self)
         if body:
@@ -213,6 +260,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 tlog("request body:", body[:CONFIG.log_body_limit].decode("utf-8", "replace"))
 
         conn = make_connection()
+        response_started = False
 
         try:
             conn.request(
@@ -231,6 +279,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             content_type = resp.getheader("Content-Type", "")
             is_sse = "text/event-stream" in content_type.lower()
 
+            if (re.search(r"/(?:chat/completions|messages|responses|models)(?:\?|$)", target_path)
+                    and "text/html" in content_type.lower()):
+                self.json_error(502,
+                    f"AgentRouter returned HTML (HTTP {resp.status}) instead of API JSON/SSE. "
+                    "This may be a WAF challenge; check the upstream URL and access from this computer.",
+                    "upstream_html_response")
+                return
+
             vlog(
                 "upstream response:",
                 resp.status,
@@ -243,15 +299,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 tlog("upstream response headers:", redact(response_headers))
 
             self.send_response(resp.status, resp.reason)
-
-            if is_sse:
-                response_headers.pop("Content-Length", None)
-                response_headers.pop("content-length", None)
-                response_headers["Connection"] = "close"
+            response_started = True
 
             for key, value in response_headers.items():
                 if key.lower() not in HOP_BY_HOP:
                     self.send_header(key, value)
+
+            # Close-delimited responses are valid even when the upstream used
+            # chunked encoding or when SSE filtering changes the byte length.
+            self.send_header("Connection", "close")
+            self.close_connection = True
 
             self.end_headers()
 
@@ -292,15 +349,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         except Exception as exc:
             vlog("proxy error:", repr(exc))
-            payload = json.dumps({"error": {"message": f"proxy: {exc}"}}).encode()
             try:
-                self.send_response(502)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(payload)
                 self.close_connection = True
+                if not response_started:
+                    self.json_error(502, f"proxy: {exc}")
             except Exception:
                 pass
         finally:

@@ -15,6 +15,7 @@ const https = require('https');
 const fs = require('fs');
 const util = require('util');
 const { URL } = require('url');
+const { StringDecoder } = require('string_decoder');
 
 const argv = process.argv.slice(2);
 
@@ -55,7 +56,8 @@ const CONFIG = {
 
 const upstreamUrl = new URL(CONFIG.upstream);
 const upstreamBasePath = upstreamUrl.pathname.replace(/\/+$/, '');
-const agent = new https.Agent({ keepAlive: true, maxSockets: 64 });
+const transport = upstreamUrl.protocol === 'http:' ? http : https;
+const agent = new transport.Agent({ keepAlive: true, maxSockets: 64 });
 
 // Copilot sets these itself; they must not be forwarded verbatim.
 const HOP_BY_HOP = new Set([
@@ -164,6 +166,7 @@ function buildUpstreamHeaders(incoming) {
  */
 function createSseSanitizer(onWrite) {
   let buffer = '';
+  const decoder = new StringDecoder('utf8');
 
   function flushFrame(frame) {
     if (!frame) return;
@@ -179,8 +182,8 @@ function createSseSanitizer(onWrite) {
     }
 
     const payload = dataLines
-      .map((line) => line.slice(5).trim())
-      .join('');
+      .map((line) => line.slice(5).replace(/^ /, ''))
+      .join('\n');
 
     if (payload === '[DONE]') {
       onWrite(frame + '\n\n');
@@ -195,7 +198,7 @@ function createSseSanitizer(onWrite) {
       return;
     }
 
-    if (!parsed || typeof parsed !== 'object') {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       log('dropped null/non-object SSE frame:', payload.slice(0, 200));
       return;
     }
@@ -203,16 +206,22 @@ function createSseSanitizer(onWrite) {
     onWrite(frame + '\n\n');
   }
 
+  function drain() {
+    let match;
+    while ((match = /\r\n\r\n|\n\n/.exec(buffer))) {
+      flushFrame(buffer.slice(0, match.index).replace(/\r\n/g, '\n'));
+      buffer = buffer.slice(match.index + match[0].length);
+    }
+  }
+
   return {
     push(chunk) {
-      buffer += chunk.toString('utf8');
-      let index;
-      while ((index = buffer.indexOf('\n\n')) !== -1) {
-        flushFrame(buffer.slice(0, index).replace(/\r/g, ''));
-        buffer = buffer.slice(index + 2);
-      }
+      buffer += decoder.write(chunk);
+      drain();
     },
     end() {
+      buffer += decoder.end();
+      drain();
       const rest = buffer.trim();
       buffer = '';
       if (rest) flushFrame(rest.replace(/\r/g, ''));
@@ -243,25 +252,43 @@ const server = http.createServer((req, res) => {
     req.on('end', () => trace(`#${id} request body:\n${reqBody.format()}`));
   }
 
-  const upstreamReq = https.request(
+  const upstreamReq = transport.request(
     {
       agent,
       protocol: upstreamUrl.protocol,
       hostname: upstreamUrl.hostname,
-      port: upstreamUrl.port || 443,
+      port: upstreamUrl.port || (upstreamUrl.protocol === 'http:' ? 80 : 443),
       method: req.method,
       path: targetPath,
       headers: upstreamHeaders,
     },
     (upstreamRes) => {
+      upstreamRes.on('error', (err) => {
+        log('upstream stream error:', err.message);
+        trace(`#${id} upstream stream error: ${err.message}`);
+        res.destroy(err);
+      });
       const responseHeaders = {};
       for (const [key, value] of Object.entries(upstreamRes.headers)) {
         if (HOP_BY_HOP.has(key.toLowerCase())) continue;
         responseHeaders[key] = value;
       }
 
-      const contentType = String(upstreamRes.headers['content-type'] || '');
+      const contentType = String(upstreamRes.headers['content-type'] || '').toLowerCase();
       const isSse = contentType.includes('text/event-stream');
+
+      // WAF pages often return HTTP 200. An AI client cannot parse HTML as
+      // JSON/SSE; surface the problem instead of appearing to return no tokens.
+      if (/\/(?:chat\/completions|messages|responses|models)(?:\?|$)/.test(targetPath)
+          && contentType.includes('text/html')) {
+        upstreamRes.resume();
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: {
+          type: 'upstream_html_response',
+          message: `AgentRouter returned HTML (HTTP ${upstreamRes.statusCode}) instead of API JSON/SSE. This may be a WAF challenge; check the upstream URL and access from this computer.`,
+        }}));
+        return;
+      }
 
       if (CONFIG.log) {
         trace(
@@ -302,21 +329,22 @@ const server = http.createServer((req, res) => {
         sanitizer.end();
         res.end();
       });
-      upstreamRes.on('error', (err) => {
-        log('upstream stream error:', err.message);
-        trace(`#${id} upstream stream error: ${err.message}`);
-        res.end();
-      });
     }
   );
 
   upstreamReq.on('error', (err) => {
     log('upstream request error:', err.message);
     trace(`#${id} upstream request error: ${err.message}`);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'application/json' });
-    }
+    if (res.destroyed) return;
+    if (res.headersSent) return res.destroy(err);
+    res.writeHead(502, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `proxy: ${err.message}` } }));
+  });
+
+  upstreamReq.setTimeout(120000, () => upstreamReq.destroy(new Error('upstream timed out')));
+  req.on('aborted', () => upstreamReq.destroy());
+  res.on('close', () => {
+    if (!res.writableFinished) upstreamReq.destroy();
   });
 
   req.pipe(upstreamReq);
